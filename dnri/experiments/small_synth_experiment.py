@@ -45,7 +45,7 @@ def eval_edges(model, dataset, params):
                 inputs = inputs.cuda(non_blocking=True)
                 gt_edges = gt_edges.cuda(non_blocking=True)
 
-            _, _, _, edges, _ = model.calculate_loss(inputs, is_train=False, return_logits=True)
+            _, _, _, edges, _ = model.calculate_loss_pi(inputs, is_train=False, return_logits=True)
             edges = edges.argmax(dim=-1)
             all_edges.append(edges.cpu())
             if len(edges.shape) == 3 and len(gt_edges.shape) == 2:

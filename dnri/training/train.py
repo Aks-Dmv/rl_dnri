@@ -18,6 +18,7 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
         val_batch_size = batch_size
     accumulate_steps = params.get('accumulate_steps')
     training_scheduler = params.get('training_scheduler', None)
+    q_training_scheduler = params.get('training_scheduler', None)
     num_epochs = params.get('num_epochs', 100)
     val_interval = params.get('val_interval', 1)
     val_start = params.get('val_start', 0)
@@ -35,11 +36,16 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
     wd = params.get('wd', 0.)
     mom = params.get('mom', 0.)
     
+    # don't send q_net params to policy optimizer
+    for p in model.decoder.q_net.parameters():
+        p.requires_grad = False
     model_params = [param for param in model.parameters() if param.requires_grad]
     if params.get('use_adam', False):
         opt = torch.optim.Adam(model_params, lr=lr, weight_decay=wd)
+        q_opt = torch.optim.Adam(model.decoder.q_net.parameters(), lr=lr, weight_decay=wd)
     else:
         opt = torch.optim.SGD(model_params, lr=lr, weight_decay=wd, momentum=mom)
+        q_opt = torch.optim.SGD(model.decoder.q_net.parameters(), lr=lr, weight_decay=wd, momentum=mom)
 
     working_dir = params['working_dir']
     best_path = os.path.join(working_dir, 'best_model')
@@ -51,6 +57,7 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
         train_params = torch.load(training_path)
         start_epoch = train_params['epoch']
         opt.load_state_dict(train_params['optimizer'])
+        q_opt.load_state_dict(train_params['q_optimizer'])
         best_val_result = train_params['best_val_result']
         best_val_epoch = train_params['best_val_epoch']
         print("STARTING EPOCH: ",start_epoch)
@@ -60,6 +67,7 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
         best_val_result = 10000000
     
     training_scheduler = train_utils.build_scheduler(opt, params)
+    q_training_scheduler = train_utils.build_scheduler(q_opt, params)
     end = start = 0 
     misc.seed(1)
     for epoch in range(start_epoch, num_epochs+1):
@@ -71,7 +79,30 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
             inputs = batch['inputs']
             if gpu:
                 inputs = inputs.cuda(non_blocking=True)
-            loss, loss_nll, loss_kl, logits, _ = model.calculate_loss(inputs, is_train=True, return_logits=True)
+            
+            # critic training
+            for p in model.decoder.q_net.parameters():
+                p.requires_grad = True
+            q_opt.zero_grad()
+            loss_critic, loss_nll = model.calculate_loss_q(inputs, is_train=True, return_logits=True)
+            loss_critic.backward()
+            q_opt.step()
+            q_opt.zero_grad()
+            for p in model.decoder.q_net.parameters():
+                p.requires_grad = False
+
+            # Finally, update Q_target networks by polyak averaging.
+            # We only do it for the q_net, as we don't use the target policy
+            with torch.no_grad():
+                polyak=0.995
+                for p, p_targ in zip(model.decoder.q_net.parameters(), model.decoder_targ.q_net.parameters()):
+                    # NB: We use an in-place operations "mul_", "add_" to update target
+                    # params, as opposed to "mul" and "add", which would make new tensors.
+                    p_targ.data.mul_(polyak)
+                    p_targ.data.add_((1 - polyak) * p.data)
+
+            # policy training
+            loss, loss_policy, loss_kl, logits, _ = model.calculate_loss_pi(inputs, is_train=True, return_logits=True)
             loss.backward()
             if verbose:
                 print("\tBATCH %d OF %d: %f, %f, %f"%(batch_ind+1, len(train_data_loader), loss.item(), loss_nll.mean().item(), loss_kl.mean().item()))
@@ -89,6 +120,7 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
             
         if training_scheduler is not None:
             training_scheduler.step()
+            q_training_scheduler.step()
         
         if train_writer is not None:
             train_writer.add_scalar('loss', loss.item(), global_step=epoch)
@@ -110,7 +142,8 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
                 inputs = batch['inputs']
                 if gpu:
                     inputs = inputs.cuda(non_blocking=True)
-                loss, loss_nll, loss_kl, logits, _ = model.calculate_loss(inputs, is_train=False, teacher_forcing=val_teacher_forcing, return_logits=True)
+                loss_critic, loss_nll = model.calculate_loss_q(inputs, is_train=False, teacher_forcing=val_teacher_forcing, return_logits=True)
+                loss, loss_policy, loss_kl, logits, _ = model.calculate_loss_pi(inputs, is_train=False, teacher_forcing=val_teacher_forcing, return_logits=True)
                 total_kl += loss_kl.sum().item()
                 total_nll += loss_nll.sum().item()
                 if verbose:
@@ -136,6 +169,7 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
         torch.save({
                     'epoch':epoch+1,
                     'optimizer':opt.state_dict(),
+                    'q_optimizer':q_opt.state_dict(),
                     'best_val_result':best_val_result,
                     'best_val_epoch':best_val_epoch,
                    }, training_path)

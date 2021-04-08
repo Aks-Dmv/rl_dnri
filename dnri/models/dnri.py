@@ -2,6 +2,8 @@ import torch
 from torch import nn
 from torch.nn import init
 import torch.nn.functional as F
+from torch.distributions.normal import Normal
+from copy import deepcopy
 import numpy as np
 from . import model_utils
 from .model_utils import RefNRIMLP, encode_onehot
@@ -19,6 +21,10 @@ class DNRI(nn.Module):
             self.decoder = DNRI_MLP_Decoder(params)
         else:
             self.decoder = DNRI_Decoder(params)
+        self.decoder_targ = deepcopy(self.decoder)
+        # Freeze target networks with respect to optimizers (only update via polyak averaging)
+        for p in self.decoder_targ.parameters():
+            p.requires_grad = False
         self.num_edge_types = params.get('num_edge_types')
 
         # Training params
@@ -61,20 +67,104 @@ class DNRI(nn.Module):
                     log_prior = log_prior.cuda(non_blocking=True)
                 self.log_prior = log_prior
 
+    def single_step_Critic(self, inputs, decoder_hidden, edge_logits, hard_sample):
+        old_shape = edge_logits.shape
+        edges = model_utils.gumbel_softmax(
+            edge_logits.reshape(-1, self.num_edge_types), 
+            tau=self.gumbel_temp, 
+            hard=hard_sample).view(old_shape)
+        predictions, logp_pi, decoder_hidden, hidden_pred, pi_action = self.decoder(inputs, decoder_hidden, edges)
+
+        q1_critic, q2_critic = self.decoder.q_net(hidden_pred.detach(), pi_action.detach())
+
+        q1_target, q2_target = self.decoder_targ.q_net(hidden_pred.detach(), pi_action.detach())
+        q_pi_targ = torch.min(q1_target, q2_target)
+        
+        return predictions, logp_pi, decoder_hidden, q1_critic, q2_critic, q_pi_targ, edges
+    
+    def single_step_Actor(self, inputs, decoder_hidden, edge_logits, hard_sample):
+        old_shape = edge_logits.shape
+        edges = model_utils.gumbel_softmax(
+            edge_logits.reshape(-1, self.num_edge_types), 
+            tau=self.gumbel_temp, 
+            hard=hard_sample).view(old_shape)
+        predictions, logp_pi, decoder_hidden, hidden_pred, pi_action = self.decoder(inputs, decoder_hidden, edges)
+        
+        q1_policy, q2_policy = self.decoder.q_net(hidden_pred.detach(), pi_action)
+        q_pi_critic = torch.min(q1_policy, q2_policy)
+        
+        return predictions, logp_pi, decoder_hidden, q_pi_critic, edges
+    
     def single_step_forward(self, inputs, decoder_hidden, edge_logits, hard_sample):
         old_shape = edge_logits.shape
         edges = model_utils.gumbel_softmax(
             edge_logits.reshape(-1, self.num_edge_types), 
             tau=self.gumbel_temp, 
             hard=hard_sample).view(old_shape)
-        predictions, decoder_hidden = self.decoder(inputs, decoder_hidden, edges)
+        predictions, _, decoder_hidden, _, _ = self.decoder(inputs, decoder_hidden, edges)
         return predictions, decoder_hidden, edges
 
-    def calculate_loss(self, inputs, is_train=False, teacher_forcing=True, return_edges=False, return_logits=False, use_prior_logits=False):
+    def calculate_loss_q(self, inputs, is_train=False, teacher_forcing=True, return_edges=False, return_logits=False, use_prior_logits=False):
         decoder_hidden = self.decoder.get_initial_hidden(inputs)
         num_time_steps = inputs.size(1)
         all_edges = []
         all_predictions = []
+        all_logp_pi = []
+        all_q1_c = []
+        all_q2_c = []
+        all_q_target = []
+        all_priors = []
+        hard_sample = (not is_train) or self.train_hard_sample
+        prior_logits, posterior_logits, _ = self.encoder(inputs)
+        if not is_train:
+            teacher_forcing_steps = self.val_teacher_forcing_steps
+        else:
+            teacher_forcing_steps = self.teacher_forcing_steps
+        
+        # we change the number of steps from (num_time_steps-1), to num_time_steps
+        # as we need to get the q_target values of the next states
+        for step in range(num_time_steps):
+            if ((teacher_forcing and (teacher_forcing_steps == -1 or step < teacher_forcing_steps)) or step == 0) and step < num_time_steps - 1:
+                current_inputs = inputs[:, step]
+            else:
+                current_inputs = predictions
+            if not use_prior_logits:
+                current_p_logits = posterior_logits[:, step]
+            else:
+                current_p_logits = prior_logits[:, step]
+            predictions, logp_pi, decoder_hidden, q1_critic, q2_critic, q_pi_targ, edges = self.single_step_Critic(current_inputs, decoder_hidden, current_p_logits, hard_sample)
+            all_predictions.append(predictions)
+            all_logp_pi.append(logp_pi)
+            all_q1_c.append(q1_critic)
+            all_q2_c.append(q2_critic)
+            all_q_target.append(q_pi_targ)
+            all_edges.append(edges)
+        all_predictions = torch.stack(all_predictions, dim=1)
+        all_logp_pi = torch.stack(all_logp_pi, dim=1)
+        all_q1_c = torch.stack(all_q1_c, dim=1)
+        all_q2_c = torch.stack(all_q2_c, dim=1)
+        all_q_target = torch.stack(all_q_target, dim=1)
+
+        target = inputs[:, 1:, :, :]
+        # removed the last all_predictions as the last for looping was essentially to calculate q_target and log_pi
+        loss_nll = self.nll(all_predictions[:, :-1], target)
+
+        # critic loss
+        gamma = 0.99
+        alpha = 0.2
+        rewards_to_go = -1.*loss_nll + gamma * (all_q_target[:, 1:].mean(dim=-1) - alpha * all_logp_pi[:, 1:])
+        rewards_to_go[:, -1] = -1.*loss_nll[:, -1] # assuming finite-horizon MDP
+        loss_critic = ((all_q1_c[:, :-1].mean(dim=-1) - rewards_to_go.detach())**2).mean() + ((all_q2_c[:, :-1].mean(dim=-1) - rewards_to_go.detach())**2).mean()
+
+        return loss_critic, loss_nll
+    
+    def calculate_loss_pi(self, inputs, is_train=False, teacher_forcing=True, return_edges=False, return_logits=False, use_prior_logits=False):
+        decoder_hidden = self.decoder.get_initial_hidden(inputs)
+        num_time_steps = inputs.size(1)
+        all_edges = []
+        all_predictions = []
+        all_logp_pi = []
+        all_q_pi = []
         all_priors = []
         hard_sample = (not is_train) or self.train_hard_sample
         prior_logits, posterior_logits, _ = self.encoder(inputs[:, :-1])
@@ -91,25 +181,31 @@ class DNRI(nn.Module):
                 current_p_logits = posterior_logits[:, step]
             else:
                 current_p_logits = prior_logits[:, step]
-            predictions, decoder_hidden, edges = self.single_step_forward(current_inputs, decoder_hidden, current_p_logits, hard_sample)
+            predictions, logp_pi, decoder_hidden, q_pi_critic, edges = self.single_step_Actor(current_inputs, decoder_hidden, current_p_logits, hard_sample)
             all_predictions.append(predictions)
+            all_logp_pi.append(logp_pi)
+            all_q_pi.append(q_pi_critic)
             all_edges.append(edges)
         all_predictions = torch.stack(all_predictions, dim=1)
-        target = inputs[:, 1:, :, :]
-        loss_nll = self.nll(all_predictions, target)
+        all_logp_pi = torch.stack(all_logp_pi, dim=1)
+        all_q_pi = torch.stack(all_q_pi, dim=1)
+
+        # actor loss
+        alpha = 0.2
+        loss_policy = alpha * all_logp_pi - all_q_pi.mean(dim=-1)
+
         prob = F.softmax(posterior_logits, dim=-1)
         loss_kl = self.kl_categorical_learned(prob, prior_logits)
         if self.add_uniform_prior:
             loss_kl = 0.5*loss_kl + 0.5*self.kl_categorical_avg(prob)
-        loss = loss_nll + self.kl_coef*loss_kl
-        loss = loss.mean()
+        loss = loss_policy.mean() + self.kl_coef*loss_kl.mean()
 
         if return_edges:
-            return loss, loss_nll, loss_kl, edges
+            return loss, loss_policy, loss_kl, edges
         elif return_logits:
-            return loss, loss_nll, loss_kl, posterior_logits, all_predictions
+            return loss, loss_policy, loss_kl, posterior_logits, all_predictions
         else:
-            return loss, loss_nll, loss_kl
+            return loss, loss_policy, loss_kl
 
     def predict_future(self, inputs, prediction_steps, return_edges=False, return_everything=False):
         burn_in_timesteps = inputs.size(1)
@@ -219,7 +315,7 @@ class DNRI(nn.Module):
         if self.normalize_nll_per_var:
             return neg_log_p.sum() / (target.size(0) * target.size(2))
         elif self.normalize_nll:
-            return (neg_log_p.sum(-1) + const).view(preds.size(0), -1).mean(dim=1)
+            return (neg_log_p.sum(-1) + const)#.view(preds.size(0), -1).mean(dim=1)
         else:
             return neg_log_p.view(target.size(0), -1).sum() / (target.size(1))
 
@@ -471,6 +567,24 @@ class DNRI_Encoder(nn.Module):
         prior_state = (prior_state[0].view(old_prior_shape), prior_state[1].view(old_prior_shape))
         return prior_result, prior_state
 
+class MLPQFunction(nn.Module):
+
+    def __init__(self, obs_dim, act_dim, hidden_size):
+        super().__init__()
+        self.q1_layer1 = nn.Linear(obs_dim + act_dim, hidden_size)
+        self.q2_layer1 = nn.Linear(obs_dim + act_dim, hidden_size)
+
+        self.q1_layer2 = nn.Linear(hidden_size, 1)
+        self.q2_layer2 = nn.Linear(hidden_size, 1)
+
+    def forward(self, q_input, pi_action):
+        q1_l1 = self.q1_layer1( torch.cat([q_input, pi_action], dim=-1) )
+        q2_l1 = self.q2_layer1( torch.cat([q_input, pi_action], dim=-1) )
+
+        q1 = self.q1_layer2( F.relu(q1_l1) )
+        q2 = self.q2_layer2( F.relu(q2_l1) )
+
+        return q1, q2
     
 class DNRI_Decoder(nn.Module):
     def __init__(self, params):
@@ -503,7 +617,11 @@ class DNRI_Decoder(nn.Module):
 
         self.out_fc1 = nn.Linear(n_hid, n_hid)
         self.out_fc2 = nn.Linear(n_hid, n_hid)
-        self.out_fc3 = nn.Linear(n_hid, out_size)
+
+        self.mu_layer = nn.Linear(n_hid, out_size)
+        self.log_std_layer = nn.Linear(n_hid, out_size)
+
+        self.q_net = MLPQFunction(n_hid, out_size, n_hid)
 
         print('Using learned recurrent interaction net decoder.')
 
@@ -575,11 +693,23 @@ class DNRI_Decoder(nn.Module):
         # Output MLP
         pred = F.dropout(F.relu(self.out_fc1(hidden)), p=dropout_prob)
         pred = F.dropout(F.relu(self.out_fc2(pred)), p=dropout_prob)
-        pred = self.out_fc3(pred)
 
-        pred = inputs + pred
+        mu = self.mu_layer(pred)
+        log_std = self.log_std_layer(pred)
+        log_std = torch.clamp(log_std, 0.0001, 1)
+        std = torch.exp(log_std)
 
-        return pred, hidden
+        pi_distribution = Normal(mu, std)
+        if self.training:
+            pi_action = pi_distribution.rsample()
+        else:
+            pi_action = mu
+
+        logp_pi = pi_distribution.log_prob(pi_action).sum(axis=-1)
+        logp_pi -= (2*(np.log(2) - pi_action - F.softplus(-2*pi_action))).sum(axis=-1)
+
+        # Predict position/velocity difference
+        return inputs + pi_action, logp_pi, hidden, pred.clone(), pi_action.clone()
 
 
 class DNRI_MLP_Decoder(nn.Module):
@@ -605,7 +735,11 @@ class DNRI_MLP_Decoder(nn.Module):
         out_size = n_in_node
         self.out_fc1 = nn.Linear(in_size + msg_out, n_hid)
         self.out_fc2 = nn.Linear(n_hid, n_hid)
-        self.out_fc3 = nn.Linear(n_hid, out_size)
+
+        self.mu_layer = nn.Linear(n_hid, out_size)
+        self.log_std_layer = nn.Linear(n_hid, out_size)
+
+        self.q_net = MLPQFunction(n_hid, out_size, n_hid)
 
         print('Using learned interaction net decoder.')
 
@@ -666,7 +800,20 @@ class DNRI_MLP_Decoder(nn.Module):
         # Output MLP
         pred = F.dropout(F.relu(self.out_fc1(aug_inputs)), p=p)
         pred = F.dropout(F.relu(self.out_fc2(pred)), p=p)
-        pred = self.out_fc3(pred)
+
+        mu = self.mu_layer(pred)
+        log_std = self.log_std_layer(pred)
+        log_std = torch.clamp(log_std, 0.0001, 1)
+        std = torch.exp(log_std)
+
+        pi_distribution = Normal(mu, std)
+        if self.training:
+            pi_action = pi_distribution.rsample()
+        else:
+            pi_action = mu
+
+        logp_pi = pi_distribution.log_prob(pi_action).sum(axis=-1)
+        logp_pi -= (2*(np.log(2) - pi_action - F.softplus(-2*pi_action))).sum(axis=-1)
 
         # Predict position/velocity difference
-        return inputs + pred, None
+        return inputs + pi_action, logp_pi, None, pred.clone(), pi_action.clone()

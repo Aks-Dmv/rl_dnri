@@ -115,7 +115,7 @@ class DNRI(nn.Module):
         all_q_target = []
         all_priors = []
         hard_sample = (not is_train) or self.train_hard_sample
-        prior_logits, posterior_logits, _ = self.encoder(inputs)
+        prior_logits, _ = self.encoder(inputs)
         if not is_train:
             teacher_forcing_steps = self.val_teacher_forcing_steps
         else:
@@ -128,10 +128,8 @@ class DNRI(nn.Module):
                 current_inputs = inputs[:, step]
             else:
                 current_inputs = predictions
-            if not use_prior_logits:
-                current_p_logits = posterior_logits[:, step]
-            else:
-                current_p_logits = prior_logits[:, step]
+
+            current_p_logits = prior_logits[:, step]
             predictions, logp_pi, decoder_hidden, q1_critic, q2_critic, q_pi_targ, edges = self.single_step_Critic(current_inputs, decoder_hidden, current_p_logits, hard_sample)
             all_predictions.append(predictions)
             all_logp_pi.append(logp_pi)
@@ -167,7 +165,7 @@ class DNRI(nn.Module):
         all_q_pi = []
         all_priors = []
         hard_sample = (not is_train) or self.train_hard_sample
-        prior_logits, posterior_logits, _ = self.encoder(inputs[:, :-1])
+        prior_logits, _ = self.encoder(inputs[:, :-1])
         if not is_train:
             teacher_forcing_steps = self.val_teacher_forcing_steps
         else:
@@ -177,10 +175,8 @@ class DNRI(nn.Module):
                 current_inputs = inputs[:, step]
             else:
                 current_inputs = predictions
-            if not use_prior_logits:
-                current_p_logits = posterior_logits[:, step]
-            else:
-                current_p_logits = prior_logits[:, step]
+
+            current_p_logits = prior_logits[:, step]
             predictions, logp_pi, decoder_hidden, q_pi_critic, edges = self.single_step_Actor(current_inputs, decoder_hidden, current_p_logits, hard_sample)
             all_predictions.append(predictions)
             all_logp_pi.append(logp_pi)
@@ -194,16 +190,15 @@ class DNRI(nn.Module):
         alpha = 0.2
         loss_policy = alpha * all_logp_pi - all_q_pi.mean(dim=-1)
 
-        prob = F.softmax(posterior_logits, dim=-1)
-        loss_kl = self.kl_categorical_learned(prob, prior_logits)
+        prob = F.softmax(prior_logits, dim=-1)
         if self.add_uniform_prior:
-            loss_kl = 0.5*loss_kl + 0.5*self.kl_categorical_avg(prob)
+            loss_kl = self.kl_categorical_avg(prob)
         loss = loss_policy.mean() + self.kl_coef*loss_kl.mean()
 
         if return_edges:
             return loss, loss_policy, loss_kl, edges
         elif return_logits:
-            return loss, loss_policy, loss_kl, posterior_logits, all_predictions
+            return loss, loss_policy, loss_kl, prior_logits, all_predictions
         else:
             return loss, loss_policy, loss_kl
 
@@ -212,7 +207,7 @@ class DNRI(nn.Module):
         decoder_hidden = self.decoder.get_initial_hidden(inputs)
         all_predictions = []
         all_edges = []
-        prior_logits, _, prior_hidden = self.encoder(inputs[:, :-1])
+        prior_logits, prior_hidden = self.encoder(inputs[:, :-1])
         for step in range(burn_in_timesteps-1):
             current_inputs = inputs[:, step]
             current_edge_logits = prior_logits[:, step]
@@ -251,7 +246,7 @@ class DNRI(nn.Module):
 
     def predict_future_fixedwindow(self, inputs, burn_in_steps, prediction_steps, batch_size, return_edges=False):
         print("INPUT SHAPE: ",inputs.shape)
-        prior_logits, _, prior_hidden = self.encoder(inputs[:, :-1])
+        prior_logits, prior_hidden = self.encoder(inputs[:, :-1])
         decoder_hidden = self.decoder.get_initial_hidden(inputs)
         for step in range(burn_in_steps-1):
             current_inputs = inputs[:, step]
@@ -388,22 +383,8 @@ class DNRI_Encoder(nn.Module):
             rnn_hidden_size = hidden_size
         if rnn_type == 'lstm':
             self.forward_rnn = nn.LSTM(hidden_size, rnn_hidden_size, batch_first=True)
-            self.reverse_rnn = nn.LSTM(hidden_size, rnn_hidden_size, batch_first=True)
         elif rnn_type == 'gru':
             self.forward_rnn = nn.GRU(hidden_size, rnn_hidden_size, batch_first=True)
-            self.reverse_rnn = nn.GRU(hidden_size, rnn_hidden_size, batch_first=True)
-        out_hidden_size = 2*rnn_hidden_size
-        num_layers = params['encoder_mlp_num_layers']
-        if num_layers == 1:
-            self.encoder_fc_out = nn.Linear(out_hidden_size, self.num_edges)
-        else:
-            tmp_hidden_size = params['encoder_mlp_hidden']
-            layers = [nn.Linear(out_hidden_size, tmp_hidden_size), nn.ELU(inplace=True)]
-            for _ in range(num_layers - 2):
-                layers.append(nn.Linear(tmp_hidden_size, tmp_hidden_size))
-                layers.append(nn.ELU(inplace=True))
-            layers.append(nn.Linear(tmp_hidden_size, self.num_edges))
-            self.encoder_fc_out = nn.Sequential(*layers)
 
         num_layers = params['prior_num_layers']
         if num_layers == 1:
@@ -492,15 +473,10 @@ class DNRI_Encoder(nn.Module):
             x = x.contiguous().view(-1, old_shape[2], old_shape[3])
             forward_x, prior_state = self.forward_rnn(x)
             timesteps = old_shape[2]
-            reverse_x = x.flip(1)
-            reverse_x, _ = self.reverse_rnn(reverse_x)
-            reverse_x = reverse_x.flip(1)
             
             #x: [batch*num_edges, num_timesteps, hidden_size]
             prior_result = self.prior_fc_out(forward_x).view(old_shape[0], old_shape[1], timesteps, self.num_edges).transpose(1,2).contiguous()
-            combined_x = torch.cat([forward_x, reverse_x], dim=-1)
-            encoder_result = self.encoder_fc_out(combined_x).view(old_shape[0], old_shape[1], timesteps, self.num_edges).transpose(1,2).contiguous()
-            return prior_result, encoder_result, prior_state
+            return prior_result, prior_state
         else:
             # Inputs is shape [batch, num_timesteps, num_vars, input_size]
             num_timesteps = inputs.size(1)
@@ -530,19 +506,9 @@ class DNRI_Encoder(nn.Module):
                 all_x.append(x.cpu())
                 all_forward_x.append(forward_x.cpu())
                 all_prior_result.append(self.prior_fc_out(forward_x).view(old_shape[0], 1, old_shape[1], self.num_edges).cpu())
-            reverse_state = None
-            all_encoder_result = []
-            for timestep in range(num_timesteps-1, -1, -1):
-                x = all_x[timestep].cuda()
-                reverse_x, reverse_state = self.reverse_rnn(x, reverse_state)
-                forward_x = all_forward_x[timestep].cuda()
-                
-                #x: [batch*num_edges, num_timesteps, hidden_size]
-                combined_x = torch.cat([forward_x, reverse_x], dim=-1)
-                all_encoder_result.append(self.encoder_fc_out(combined_x).view(inputs.size(0), 1, -1, self.num_edges))
+            
             prior_result = torch.cat(all_prior_result, dim=1).cuda(non_blocking=True)
-            encoder_result = torch.cat(all_encoder_result, dim=1).cuda(non_blocking=True)
-            return prior_result, encoder_result, prior_state
+            return prior_result, prior_state
 
     def single_step_forward(self, inputs, prior_state):
         # Inputs is shape [batch, num_vars, input_size]

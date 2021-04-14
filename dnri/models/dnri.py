@@ -662,7 +662,7 @@ class DNRI_Decoder(nn.Module):
 
         mu = self.mu_layer(pred)
         log_std = self.log_std_layer(pred)
-        log_std = torch.clamp(log_std, 0.0001, 1)
+        log_std = torch.clamp(log_std, -3, 1)
         std = torch.exp(log_std)
 
         pi_distribution = Normal(mu, std)
@@ -769,7 +769,7 @@ class DNRI_MLP_Decoder(nn.Module):
 
         mu = self.mu_layer(pred)
         log_std = self.log_std_layer(pred)
-        log_std = torch.clamp(log_std, 0.0001, 1)
+        log_std = torch.clamp(log_std, -3, 1)
         std = torch.exp(log_std)
 
         pi_distribution = Normal(mu, std)

@@ -25,6 +25,10 @@ class DNRI(nn.Module):
         # Freeze target networks with respect to optimizers (only update via polyak averaging)
         for p in self.decoder_targ.parameters():
             p.requires_grad = False
+        self.Q_graph = Option_Value_Fn(params)
+        self.Q_graph_targ = deepcopy(self.Q_graph)
+        for p in self.Q_graph_targ.parameters():
+            p.requires_grad = False
         self.num_edge_types = params.get('num_edge_types')
 
         # Training params
@@ -74,13 +78,17 @@ class DNRI(nn.Module):
             tau=self.gumbel_temp, 
             hard=hard_sample).view(old_shape)
         predictions, logp_pi, decoder_hidden, hidden_pred, pi_action = self.decoder(inputs, decoder_hidden, edges)
+        q1_s_graph, q2_s_graph = self.Q_graph(inputs.detach(), edges.detach())
+
+        q1_s_graph_target, q2_s_graph_target = self.Q_graph_targ(inputs.detach(), edges.detach())
+        q_graph_targ = torch.min(q1_s_graph_target, q2_s_graph_target)
 
         q1_critic, q2_critic = self.decoder.q_net(hidden_pred.detach(), pi_action.detach())
 
         q1_target, q2_target = self.decoder_targ.q_net(hidden_pred.detach(), pi_action.detach())
         q_pi_targ = torch.min(q1_target, q2_target)
         
-        return predictions, logp_pi, decoder_hidden, q1_critic, q2_critic, q_pi_targ, edges
+        return predictions, logp_pi, decoder_hidden, q1_critic, q2_critic, q_pi_targ, edges, q1_s_graph, q2_s_graph, q_graph_targ
     
     def single_step_Actor(self, inputs, decoder_hidden, edge_logits, hard_sample):
         old_shape = edge_logits.shape
@@ -89,11 +97,15 @@ class DNRI(nn.Module):
             tau=self.gumbel_temp, 
             hard=hard_sample).view(old_shape)
         predictions, logp_pi, decoder_hidden, hidden_pred, pi_action = self.decoder(inputs, decoder_hidden, edges)
+
+        q1_s_graph, q2_s_graph = self.Q_graph(inputs.detach(), edges)
+        q_graph_critic = torch.min(q1_s_graph, q2_s_graph)
+
         
         q1_policy, q2_policy = self.decoder.q_net(hidden_pred.detach(), pi_action)
         q_pi_critic = torch.min(q1_policy, q2_policy)
         
-        return predictions, logp_pi, decoder_hidden, q_pi_critic, edges
+        return predictions, logp_pi, decoder_hidden, q_pi_critic, edges, q_graph_critic
     
     def single_step_forward(self, inputs, decoder_hidden, edge_logits, hard_sample):
         old_shape = edge_logits.shape
@@ -113,9 +125,13 @@ class DNRI(nn.Module):
         all_q1_c = []
         all_q2_c = []
         all_q_target = []
+        all_q1_g = []
+        all_q2_g = []
+        all_q_g_target = []
         all_priors = []
         hard_sample = (not is_train) or self.train_hard_sample
-        prior_logits, _ = self.encoder(inputs)
+        prior_logits, enc_hid, graph_term = self.encoder(torch.unsqueeze(inputs[:,0], 1))
+        graph_term = F.softmax(graph_term.mean(dim=-2), dim=-1)
         if not is_train:
             teacher_forcing_steps = self.val_teacher_forcing_steps
         else:
@@ -129,23 +145,42 @@ class DNRI(nn.Module):
             else:
                 current_inputs = predictions
 
-            current_p_logits = prior_logits[:, step]
-            predictions, logp_pi, decoder_hidden, q1_critic, q2_critic, q_pi_targ, edges = self.single_step_Critic(current_inputs, decoder_hidden, current_p_logits, hard_sample)
+            if step == 0:
+                current_p_logits = prior_logits[:,step]
+            else:
+                new_p_logits, enc_hid, graph_term = self.encoder.single_step_forward(inputs[:,step], enc_hid)
+                graph_term = F.softmax(graph_term.mean(dim=-2), dim=-1) # taking mean over nodes, and then softmax
+                graph_term = torch.unsqueeze(graph_term, 1)
+                current_p_logits = graph_term * new_p_logits + (1 - graph_term) * current_p_logits
+            predictions, logp_pi, decoder_hidden, q1_critic, q2_critic, q_pi_targ, edges, q1_s_graph, q2_s_graph, q_graph_targ = self.single_step_Critic(current_inputs, decoder_hidden, current_p_logits, hard_sample)
             all_predictions.append(predictions)
             all_logp_pi.append(logp_pi)
             all_q1_c.append(q1_critic)
             all_q2_c.append(q2_critic)
             all_q_target.append(q_pi_targ)
+            all_q1_g.append(q1_s_graph)
+            all_q2_g.append(q2_s_graph)
+            all_q_g_target.append(q_graph_targ)
             all_edges.append(edges)
+            all_priors.append(current_p_logits)
         all_predictions = torch.stack(all_predictions, dim=1)
         all_logp_pi = torch.stack(all_logp_pi, dim=1)
         all_q1_c = torch.stack(all_q1_c, dim=1)
         all_q2_c = torch.stack(all_q2_c, dim=1)
         all_q_target = torch.stack(all_q_target, dim=1)
+        all_q1_g = torch.stack(all_q1_g, dim=1)
+        all_q2_g = torch.stack(all_q2_g, dim=1)
+        all_q_g_target = torch.stack(all_q_g_target, dim=1)
+        all_priors = torch.stack(all_priors, dim=1)
 
         target = inputs[:, 1:, :, :]
         # removed the last all_predictions as the last for looping was essentially to calculate q_target and log_pi
         loss_nll = self.nll(all_predictions[:, :-1], target)
+
+        prob_pr = F.softmax(all_priors, dim=-1)
+        if self.add_uniform_prior:
+            loss_kl = self.kl_categorical_avg(prob_pr)
+            # loss_kl = torch.unsqueeze(loss_kl, -1) # done to get the same shape for torch broadcasting
 
         # critic loss
         gamma = 0.99
@@ -154,7 +189,11 @@ class DNRI(nn.Module):
         rewards_to_go[:, -1] = -1.*loss_nll[:, -1] # assuming finite-horizon MDP
         loss_critic = ((all_q1_c[:, :-1].mean(dim=-1) - rewards_to_go.detach())**2).mean() + ((all_q2_c[:, :-1].mean(dim=-1) - rewards_to_go.detach())**2).mean()
 
-        return loss_critic, loss_nll
+        graph_rewards_to_go = -1.*loss_nll.mean(dim=-1) + gamma * (all_q_g_target[:, 1:].mean(dim=-1) + alpha * loss_kl[:, 1:])
+        graph_rewards_to_go[:, -1] = -1.*loss_nll[:, -1].mean(dim=-1) # assuming finite-horizon MDP
+        loss_critic += ((all_q1_g[:, :-1].mean(dim=-1) - graph_rewards_to_go.detach())**2).mean() + ((all_q2_g[:, :-1].mean(dim=-1) - graph_rewards_to_go.detach())**2).mean()
+
+        return loss_critic, loss_nll.mean(dim=-1).mean(dim=-1)
     
     def calculate_loss_pi(self, inputs, is_train=False, teacher_forcing=True, return_edges=False, return_logits=False, use_prior_logits=False):
         decoder_hidden = self.decoder.get_initial_hidden(inputs)
@@ -163,9 +202,11 @@ class DNRI(nn.Module):
         all_predictions = []
         all_logp_pi = []
         all_q_pi = []
+        all_q_g = []
         all_priors = []
         hard_sample = (not is_train) or self.train_hard_sample
-        prior_logits, _ = self.encoder(inputs[:, :-1])
+        prior_logits, enc_hid, graph_term = self.encoder(torch.unsqueeze(inputs[:,0], 1))
+        graph_term = F.softmax(graph_term.mean(dim=-2), dim=-1)
         if not is_train:
             teacher_forcing_steps = self.val_teacher_forcing_steps
         else:
@@ -176,24 +217,38 @@ class DNRI(nn.Module):
             else:
                 current_inputs = predictions
 
-            current_p_logits = prior_logits[:, step]
-            predictions, logp_pi, decoder_hidden, q_pi_critic, edges = self.single_step_Actor(current_inputs, decoder_hidden, current_p_logits, hard_sample)
+            if step == 0:
+                current_p_logits = prior_logits[:,step]
+            else:
+                new_p_logits, enc_hid, graph_term = self.encoder.single_step_forward(inputs[:,step], enc_hid)
+                graph_term = F.softmax(graph_term.mean(dim=-2), dim=-1) # taking mean over nodes
+                graph_term = torch.unsqueeze(graph_term, 1)
+                current_p_logits = graph_term * new_p_logits + (1 - graph_term) * current_p_logits
+            predictions, logp_pi, decoder_hidden, q_pi_critic, edges, q_graph_critic = self.single_step_Actor(current_inputs, decoder_hidden, current_p_logits, hard_sample)
             all_predictions.append(predictions)
             all_logp_pi.append(logp_pi)
             all_q_pi.append(q_pi_critic)
+            all_q_g.append(q_graph_critic)
             all_edges.append(edges)
+            all_priors.append(current_p_logits)
         all_predictions = torch.stack(all_predictions, dim=1)
         all_logp_pi = torch.stack(all_logp_pi, dim=1)
         all_q_pi = torch.stack(all_q_pi, dim=1)
+        all_priors = torch.stack(all_priors, dim=1)
+        all_q_g = torch.stack(all_q_g, dim=1)
 
         # actor loss
         alpha = 0.2
         loss_policy = alpha * all_logp_pi - all_q_pi.mean(dim=-1)
 
-        prob = F.softmax(prior_logits, dim=-1)
+        prob_pr = F.softmax(all_priors, dim=-1)
         if self.add_uniform_prior:
-            loss_kl = self.kl_categorical_avg(prob)
-        loss = loss_policy.mean() + self.kl_coef*loss_kl.mean()
+            loss_kl = self.kl_categorical_avg(prob_pr)
+            # loss_kl = torch.unsqueeze(loss_kl, -1) # done to get the same shape for torch broadcasting
+        
+        loss_graph = alpha * loss_kl - all_q_g.mean(dim=-1)
+
+        loss = loss_policy.mean() + loss_graph.mean()
 
         if return_edges:
             return loss, loss_policy, loss_kl, edges
@@ -207,17 +262,27 @@ class DNRI(nn.Module):
         decoder_hidden = self.decoder.get_initial_hidden(inputs)
         all_predictions = []
         all_edges = []
-        prior_logits, prior_hidden = self.encoder(inputs[:, :-1])
+        prior_logits, prior_hidden, graph_term = self.encoder(torch.unsqueeze(inputs[:,0], 1))
+        graph_term = F.softmax(graph_term.mean(dim=-2), dim=-1)
         for step in range(burn_in_timesteps-1):
             current_inputs = inputs[:, step]
-            current_edge_logits = prior_logits[:, step]
+            if step == 0:
+                current_edge_logits = prior_logits[:,step]
+            else:
+                new_p_logits, prior_hidden, graph_term = self.encoder.single_step_forward(inputs[:,step], prior_hidden)
+                graph_term = F.softmax(graph_term.mean(dim=-2), dim=-1) # taking mean over nodes
+                graph_term = torch.unsqueeze(graph_term, 1)
+                current_edge_logits = graph_term * new_p_logits + (1 - graph_term) * current_edge_logits
             predictions, decoder_hidden, edges = self.single_step_forward(current_inputs, decoder_hidden, current_edge_logits, True)
             if return_everything:
                 all_edges.append(edges)
                 all_predictions.append(predictions)
         predictions = inputs[:, burn_in_timesteps-1]
         for step in range(prediction_steps):
-            current_edge_logits, prior_hidden = self.encoder.single_step_forward(predictions, prior_hidden)
+            new_p_logits, prior_hidden, graph_term = self.encoder.single_step_forward(predictions, prior_hidden)
+            graph_term = F.softmax(graph_term.mean(dim=-2), dim=-1) # taking mean over nodes
+            graph_term = torch.unsqueeze(graph_term, 1)
+            current_edge_logits = graph_term * new_p_logits + (1 - graph_term) * current_edge_logits
             predictions, decoder_hidden, edges = self.single_step_forward(predictions, decoder_hidden, current_edge_logits, True)
             all_predictions.append(predictions)
             all_edges.append(edges)
@@ -246,11 +311,18 @@ class DNRI(nn.Module):
 
     def predict_future_fixedwindow(self, inputs, burn_in_steps, prediction_steps, batch_size, return_edges=False):
         print("INPUT SHAPE: ",inputs.shape)
-        prior_logits, prior_hidden = self.encoder(inputs[:, :-1])
+        prior_logits, prior_hidden, graph_term = self.encoder(torch.unsqueeze(inputs[:,0], 1))
+        graph_term = F.softmax(graph_term.mean(dim=-2), dim=-1)
         decoder_hidden = self.decoder.get_initial_hidden(inputs)
         for step in range(burn_in_steps-1):
             current_inputs = inputs[:, step]
-            current_edge_logits = prior_logits[:, step]
+            if step == 0:
+                current_edge_logits = prior_logits[:,step]
+            else:
+                new_p_logits, prior_hidden, graph_term = self.encoder.single_step_forward(inputs[:,step], prior_hidden)
+                graph_term = F.softmax(graph_term.mean(dim=-2), dim=-1) # taking mean over nodes
+                graph_term = torch.unsqueeze(graph_term, 1)
+                current_edge_logits = graph_term * new_p_logits + (1 - graph_term) * current_edge_logits
             predictions, decoder_hidden, _ = self.single_step_forward(current_inputs, decoder_hidden, current_edge_logits, True)
         all_timestep_preds = []
         all_timestep_edges = []
@@ -263,7 +335,10 @@ class DNRI(nn.Module):
                 if window_ind + step >= inputs.size(1):
                     break
                 predictions = inputs[:, window_ind + step] 
-                current_edge_logits, prior_hidden = self.encoder.single_step_forward(predictions, prior_hidden)
+                new_p_logits, prior_hidden, graph_term = self.encoder.single_step_forward(predictions, prior_hidden)
+                graph_term = F.softmax(graph_term.mean(dim=-2), dim=-1) # taking mean over nodes
+                graph_term = torch.unsqueeze(graph_term, 1)
+                current_edge_logits = graph_term * new_p_logits + (1 - graph_term) * current_edge_logits
                 predictions, decoder_hidden, _ = self.single_step_forward(predictions, decoder_hidden, current_edge_logits, True)
                 current_batch_preds.append(predictions)
                 tmp_prior = self.encoder.copy_states(prior_hidden)
@@ -280,7 +355,16 @@ class DNRI(nn.Module):
                 current_batch_edges = torch.cat(current_batch_edges, 0)
                 current_timestep_edges = [current_batch_edges]
             for step in range(prediction_steps - 1):
-                current_batch_edge_logits, batch_prior_hidden = self.encoder.single_step_forward(current_batch_preds, batch_prior_hidden)
+                # Not sure where it is used
+                # debug the matrix sizes if this part throws an error
+                if step == 0:
+                    current_batch_edge_logits, batch_prior_hidden, _ = self.encoder.single_step_forward(current_batch_preds, batch_prior_hidden)
+                else:
+                    new_p_logits, batch_prior_hidden, graph_term = self.encoder.single_step_forward(current_batch_preds, batch_prior_hidden)
+                    graph_term = F.softmax(graph_term.mean(dim=-2), dim=-1) # taking mean over nodes
+                    graph_term = torch.unsqueeze(graph_term, 1)
+                    current_batch_edge_logits = graph_term * new_p_logits + (1 - graph_term) * current_batch_edge_logits
+                ###########################
                 current_batch_preds, batch_decoder_hidden, _ = self.single_step_forward(current_batch_preds, batch_decoder_hidden, current_batch_edge_logits, True)
                 current_timestep_preds.append(current_batch_preds)
                 if return_edges:
@@ -341,7 +425,7 @@ class DNRI(nn.Module):
         avg_preds = preds.mean(dim=2)
         kl_div = avg_preds*(torch.log(avg_preds+eps) - self.log_prior)
         if self.normalize_kl:     
-            return kl_div.sum(-1).view(preds.size(0), -1).mean(dim=1)
+            return kl_div.sum(-1).view(preds.size(0), -1)#.mean(dim=1)
         elif self.normalize_kl_per_var:
             return kl_div.sum() / (self.num_vars * preds.size(0))
         else:
@@ -398,6 +482,7 @@ class DNRI_Encoder(nn.Module):
             layers.append(nn.Linear(tmp_hidden_size, self.num_edges))
             self.prior_fc_out = nn.Sequential(*layers)
 
+        self.term_layer = nn.Linear(rnn_hidden_size, 1)
 
         self.num_vars = num_vars
         edges = np.ones(num_vars) - np.eye(num_vars)
@@ -476,13 +561,15 @@ class DNRI_Encoder(nn.Module):
             
             #x: [batch*num_edges, num_timesteps, hidden_size]
             prior_result = self.prior_fc_out(forward_x).view(old_shape[0], old_shape[1], timesteps, self.num_edges).transpose(1,2).contiguous()
-            return prior_result, prior_state
+            graph_term = self.term_layer(forward_x).view(old_shape[0], old_shape[1], timesteps, 1).transpose(1,2).contiguous()
+            return prior_result, prior_state, graph_term
         else:
             # Inputs is shape [batch, num_timesteps, num_vars, input_size]
             num_timesteps = inputs.size(1)
             all_x = []
             all_forward_x = []
             all_prior_result = []
+            all_term = []
             prior_state = None
             for timestep in range(num_timesteps):
                 x = inputs[:, timestep]
@@ -506,9 +593,11 @@ class DNRI_Encoder(nn.Module):
                 all_x.append(x.cpu())
                 all_forward_x.append(forward_x.cpu())
                 all_prior_result.append(self.prior_fc_out(forward_x).view(old_shape[0], 1, old_shape[1], self.num_edges).cpu())
+                all_term.append(self.term_layer(forward_x).view(old_shape[0], 1, old_shape[1], 1).cpu())
             
             prior_result = torch.cat(all_prior_result, dim=1).cuda(non_blocking=True)
-            return prior_result, prior_state
+            term_result = torch.cat(all_term, dim=1).cuda(non_blocking=True)
+            return prior_result, prior_state, term_result
 
     def single_step_forward(self, inputs, prior_state):
         # Inputs is shape [batch, num_vars, input_size]
@@ -530,8 +619,9 @@ class DNRI_Encoder(nn.Module):
 
         x, prior_state = self.forward_rnn(x, prior_state)
         prior_result = self.prior_fc_out(x).view(old_shape[0], old_shape[1], self.num_edges)
+        term_result = self.term_layer(x).view(old_shape[0], old_shape[1], 1)
         prior_state = (prior_state[0].view(old_prior_shape), prior_state[1].view(old_prior_shape))
-        return prior_result, prior_state
+        return prior_result, prior_state, term_result
 
 class MLPQFunction(nn.Module):
 
@@ -783,3 +873,91 @@ class DNRI_MLP_Decoder(nn.Module):
 
         # Predict position/velocity difference
         return inputs + pi_action, logp_pi, None, pred.clone(), pi_action.clone()
+
+
+class Option_Value_Fn(nn.Module):
+    def __init__(self, params):
+        super(Option_Value_Fn, self).__init__()
+        num_vars = params['num_vars']
+        edge_types = params['num_edge_types']
+        n_hid = params['decoder_hidden']
+        msg_hid = params['decoder_hidden']
+        msg_out = msg_hid #TODO: make this a param
+        skip_first = params['skip_first']
+        n_in_node = params['input_size']
+
+        do_prob = params['decoder_dropout']
+        in_size = n_in_node
+        self.msg_fc1 = nn.ModuleList(
+            [nn.Linear(2 * in_size, msg_hid) for _ in range(edge_types)])
+        self.msg_fc2 = nn.ModuleList(
+            [nn.Linear(msg_hid, msg_out) for _ in range(edge_types)])
+        self.msg_out_shape = msg_out
+        self.skip_first_edge_type = skip_first
+
+        out_size = n_in_node
+        self.out_fc1 = nn.Linear(in_size + msg_out, 1)
+        self.out_fc2 = nn.Linear(in_size + msg_out, 1)
+
+        print('Using learned Option_Value_Fn net.')
+
+        self.dropout_prob = do_prob
+        self.num_vars = num_vars
+        edges = np.ones(num_vars) - np.eye(num_vars)
+        self.send_edges = np.where(edges)[0]
+        self.recv_edges = np.where(edges)[1]
+        self.edge2node_mat = nn.Parameter(torch.FloatTensor(encode_onehot(self.recv_edges)), requires_grad=False)
+
+    def get_initial_hidden(self, inputs):
+        return None
+
+    def forward(self, inputs, edges):
+
+        # single_timestep_inputs has shape
+        # [batch_size, num_atoms, num_dims]
+
+        # single_timestep_rel_type has shape:
+        # [batch_size, num_atoms*(num_atoms-1), num_edge_types]
+        # Node2edge
+        receivers = inputs[:, self.recv_edges, :]
+        senders = inputs[:, self.send_edges, :]
+        pre_msg = torch.cat([receivers, senders], dim=-1)
+
+        if inputs.is_cuda:
+            all_msgs = torch.cuda.FloatTensor(pre_msg.size(0), pre_msg.size(1),
+                                self.msg_out_shape).fill_(0.)
+        else:
+            all_msgs = torch.zeros(pre_msg.size(0), pre_msg.size(1),
+                                self.msg_out_shape)
+
+        if self.skip_first_edge_type:
+            start_idx = 1
+        else:
+            start_idx = 0
+        if self.training:
+            p = self.dropout_prob
+        else:
+            p = 0
+
+        # Run separate MLP for every edge type
+        # NOTE: To exlude one edge type, simply offset range by 1
+        for i in range(start_idx, len(self.msg_fc2)):
+            msg = F.relu(self.msg_fc1[i](pre_msg))
+            msg = F.dropout(msg, p=p)
+            msg = F.relu(self.msg_fc2[i](msg))
+            msg = msg * edges[:, :, i:i + 1]
+            all_msgs += msg
+
+        # Aggregate all msgs to receiver
+        agg_msgs = all_msgs.transpose(-2, -1).matmul(self.edge2node_mat).transpose(-2, -1)
+        agg_msgs = agg_msgs.contiguous()
+
+        # Skip connection
+        aug_inputs = torch.cat([inputs, agg_msgs], dim=-1)
+
+        # Output MLP
+        q1 = F.dropout(F.relu(self.out_fc1(aug_inputs)), p=p)
+        q2 = F.dropout(F.relu(self.out_fc2(aug_inputs)), p=p)
+
+        # Predict position/velocity difference
+        return q1.sum(dim=-2), q2.sum(dim=-2) # sum over the nodes (i.e. dim = -2), not the features (i.e. dim = -1)

@@ -39,13 +39,15 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
     # don't send q_net params to policy optimizer
     for p in model.decoder.q_net.parameters():
         p.requires_grad = False
+    for p in model.Q_graph.parameters():
+        p.requires_grad = False
     model_params = [param for param in model.parameters() if param.requires_grad]
     if params.get('use_adam', False):
         opt = torch.optim.Adam(model_params, lr=lr, weight_decay=wd)
-        q_opt = torch.optim.Adam(model.decoder.q_net.parameters(), lr=lr, weight_decay=wd)
+        q_opt = torch.optim.Adam(list(model.decoder.q_net.parameters()) + list(model.Q_graph.parameters()), lr=lr, weight_decay=wd)
     else:
         opt = torch.optim.SGD(model_params, lr=lr, weight_decay=wd, momentum=mom)
-        q_opt = torch.optim.SGD(model.decoder.q_net.parameters(), lr=lr, weight_decay=wd, momentum=mom)
+        q_opt = torch.optim.SGD(list(model.decoder.q_net.parameters()) + list(model.Q_graph.parameters()), lr=lr, weight_decay=wd, momentum=mom)
 
     working_dir = params['working_dir']
     best_path = os.path.join(working_dir, 'best_model')
@@ -83,12 +85,20 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
             # critic training
             for p in model.decoder.q_net.parameters():
                 p.requires_grad = True
+            for p in model.Q_graph.parameters():
+                p.requires_grad = True
             q_opt.zero_grad()
-            loss_critic, loss_nll = model.calculate_loss_q(inputs, is_train=True, return_logits=True)
-            loss_critic.backward()
-            q_opt.step()
-            q_opt.zero_grad()
+            opt.zero_grad()
+            for _ in range(5):
+                loss_critic, loss_nll = model.calculate_loss_q(inputs, is_train=True, return_logits=True)
+                loss_critic.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+                q_opt.step()
+                q_opt.zero_grad()
+                opt.zero_grad()
             for p in model.decoder.q_net.parameters():
+                p.requires_grad = False
+            for p in model.Q_graph.parameters():
                 p.requires_grad = False
 
             # Finally, update Q_target networks by polyak averaging.
@@ -100,23 +110,23 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
                     # params, as opposed to "mul" and "add", which would make new tensors.
                     p_targ.data.mul_(polyak)
                     p_targ.data.add_((1 - polyak) * p.data)
+                
+                for p, p_targ in zip(model.Q_graph.parameters(), model.Q_graph_targ.parameters()):
+                    # NB: We use an in-place operations "mul_", "add_" to update target
+                    # params, as opposed to "mul" and "add", which would make new tensors.
+                    p_targ.data.mul_(polyak)
+                    p_targ.data.add_((1 - polyak) * p.data)
 
             # policy training
-            loss, loss_policy, loss_kl, logits, _ = model.calculate_loss_pi(inputs, is_train=True, return_logits=True)
-            loss.backward()
-            if verbose:
-                print("\tBATCH %d OF %d: %f, %f, %f"%(batch_ind+1, len(train_data_loader), loss.item(), loss_nll.mean().item(), loss_kl.mean().item()))
-            if accumulate_steps == -1 or (batch_ind+1)%accumulate_steps == 0:
-                if verbose and accumulate_steps > 0:
-                    print("\tUPDATING WEIGHTS")
-                if clip_grad is not None:
-                    nn.utils.clip_grad_value_(model.parameters(), clip_grad)
-                elif clip_grad_norm is not None:
-                    nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)        
+            q_opt.zero_grad()
+            opt.zero_grad()
+            for _ in range(2):
+                loss, loss_policy, loss_kl, logits, _ = model.calculate_loss_pi(inputs, is_train=True, return_logits=True)
+                loss.backward()       
                 opt.step()
                 opt.zero_grad()
-                if accumulate_steps > 0 and accumulate_steps > len(train_data_loader) - batch_ind - 1:
-                    break
+                q_opt.zero_grad()
+
             
         if training_scheduler is not None:
             training_scheduler.step()

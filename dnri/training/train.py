@@ -122,7 +122,8 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
             opt.zero_grad()
             for _ in range(2):
                 loss, loss_policy, loss_kl, logits, _ = model.calculate_loss_pi(inputs, is_train=True, return_logits=True)
-                loss.backward()       
+                loss.backward() 
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)      
                 opt.step()
                 opt.zero_grad()
                 q_opt.zero_grad()

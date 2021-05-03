@@ -131,7 +131,7 @@ class DNRI(nn.Module):
         all_priors = []
         hard_sample = (not is_train) or self.train_hard_sample
         prior_logits, enc_hid, graph_term = self.encoder(torch.unsqueeze(inputs[:,0], 1))
-        graph_term = F.softmax(graph_term.mean(dim=-2), dim=-1)
+        graph_term = torch.sigmoid(graph_term.mean(dim=-2))
         if not is_train:
             teacher_forcing_steps = self.val_teacher_forcing_steps
         else:
@@ -149,7 +149,7 @@ class DNRI(nn.Module):
                 current_p_logits = prior_logits[:,step]
             else:
                 new_p_logits, enc_hid, graph_term = self.encoder.single_step_forward(inputs[:,step], enc_hid)
-                graph_term = F.softmax(graph_term.mean(dim=-2), dim=-1) # taking mean over nodes, and then softmax
+                graph_term = torch.sigmoid(graph_term.mean(dim=-2)) # taking mean over nodes, and then sigmoid
                 graph_term = torch.unsqueeze(graph_term, 1)
                 current_p_logits = graph_term * new_p_logits + (1 - graph_term) * current_p_logits
             predictions, logp_pi, decoder_hidden, q1_critic, q2_critic, q_pi_targ, edges, q1_s_graph, q2_s_graph, q_graph_targ = self.single_step_Critic(current_inputs, decoder_hidden, current_p_logits, hard_sample)
@@ -206,7 +206,7 @@ class DNRI(nn.Module):
         all_priors = []
         hard_sample = (not is_train) or self.train_hard_sample
         prior_logits, enc_hid, graph_term = self.encoder(torch.unsqueeze(inputs[:,0], 1))
-        graph_term = F.softmax(graph_term.mean(dim=-2), dim=-1)
+        graph_term = torch.sigmoid(graph_term.mean(dim=-2))
         if not is_train:
             teacher_forcing_steps = self.val_teacher_forcing_steps
         else:
@@ -221,7 +221,7 @@ class DNRI(nn.Module):
                 current_p_logits = prior_logits[:,step]
             else:
                 new_p_logits, enc_hid, graph_term = self.encoder.single_step_forward(inputs[:,step], enc_hid)
-                graph_term = F.softmax(graph_term.mean(dim=-2), dim=-1) # taking mean over nodes
+                graph_term = torch.sigmoid(graph_term.mean(dim=-2)) # taking mean over nodes
                 graph_term = torch.unsqueeze(graph_term, 1)
                 current_p_logits = graph_term * new_p_logits + (1 - graph_term) * current_p_logits
             predictions, logp_pi, decoder_hidden, q_pi_critic, edges, q_graph_critic = self.single_step_Actor(current_inputs, decoder_hidden, current_p_logits, hard_sample)
@@ -263,14 +263,14 @@ class DNRI(nn.Module):
         all_predictions = []
         all_edges = []
         prior_logits, prior_hidden, graph_term = self.encoder(torch.unsqueeze(inputs[:,0], 1))
-        graph_term = F.softmax(graph_term.mean(dim=-2), dim=-1)
+        graph_term = torch.sigmoid(graph_term.mean(dim=-2))
         for step in range(burn_in_timesteps-1):
             current_inputs = inputs[:, step]
             if step == 0:
                 current_edge_logits = prior_logits[:,step]
             else:
                 new_p_logits, prior_hidden, graph_term = self.encoder.single_step_forward(inputs[:,step], prior_hidden)
-                graph_term = F.softmax(graph_term.mean(dim=-2), dim=-1) # taking mean over nodes
+                graph_term = torch.sigmoid(graph_term.mean(dim=-2)) # taking mean over nodes
                 graph_term = torch.unsqueeze(graph_term, 1)
                 current_edge_logits = graph_term * new_p_logits + (1 - graph_term) * current_edge_logits
             predictions, decoder_hidden, edges = self.single_step_forward(current_inputs, decoder_hidden, current_edge_logits, True)
@@ -280,7 +280,7 @@ class DNRI(nn.Module):
         predictions = inputs[:, burn_in_timesteps-1]
         for step in range(prediction_steps):
             new_p_logits, prior_hidden, graph_term = self.encoder.single_step_forward(predictions, prior_hidden)
-            graph_term = F.softmax(graph_term.mean(dim=-2), dim=-1) # taking mean over nodes
+            graph_term = torch.sigmoid(graph_term.mean(dim=-2)) # taking mean over nodes
             graph_term = torch.unsqueeze(graph_term, 1)
             current_edge_logits = graph_term * new_p_logits + (1 - graph_term) * current_edge_logits
             predictions, decoder_hidden, edges = self.single_step_forward(predictions, decoder_hidden, current_edge_logits, True)
@@ -312,7 +312,7 @@ class DNRI(nn.Module):
     def predict_future_fixedwindow(self, inputs, burn_in_steps, prediction_steps, batch_size, return_edges=False):
         print("INPUT SHAPE: ",inputs.shape)
         prior_logits, prior_hidden, graph_term = self.encoder(torch.unsqueeze(inputs[:,0], 1))
-        graph_term = F.softmax(graph_term.mean(dim=-2), dim=-1)
+        graph_term = torch.sigmoid(graph_term.mean(dim=-2))
         decoder_hidden = self.decoder.get_initial_hidden(inputs)
         for step in range(burn_in_steps-1):
             current_inputs = inputs[:, step]
@@ -320,7 +320,7 @@ class DNRI(nn.Module):
                 current_edge_logits = prior_logits[:,step]
             else:
                 new_p_logits, prior_hidden, graph_term = self.encoder.single_step_forward(inputs[:,step], prior_hidden)
-                graph_term = F.softmax(graph_term.mean(dim=-2), dim=-1) # taking mean over nodes
+                graph_term = torch.sigmoid(graph_term.mean(dim=-2)) # taking mean over nodes
                 graph_term = torch.unsqueeze(graph_term, 1)
                 current_edge_logits = graph_term * new_p_logits + (1 - graph_term) * current_edge_logits
             predictions, decoder_hidden, _ = self.single_step_forward(current_inputs, decoder_hidden, current_edge_logits, True)
@@ -336,7 +336,7 @@ class DNRI(nn.Module):
                     break
                 predictions = inputs[:, window_ind + step] 
                 new_p_logits, prior_hidden, graph_term = self.encoder.single_step_forward(predictions, prior_hidden)
-                graph_term = F.softmax(graph_term.mean(dim=-2), dim=-1) # taking mean over nodes
+                graph_term = torch.sigmoid(graph_term.mean(dim=-2)) # taking mean over nodes
                 graph_term = torch.unsqueeze(graph_term, 1)
                 current_edge_logits = graph_term * new_p_logits + (1 - graph_term) * current_edge_logits
                 predictions, decoder_hidden, _ = self.single_step_forward(predictions, decoder_hidden, current_edge_logits, True)
@@ -361,7 +361,7 @@ class DNRI(nn.Module):
                     current_batch_edge_logits, batch_prior_hidden, _ = self.encoder.single_step_forward(current_batch_preds, batch_prior_hidden)
                 else:
                     new_p_logits, batch_prior_hidden, graph_term = self.encoder.single_step_forward(current_batch_preds, batch_prior_hidden)
-                    graph_term = F.softmax(graph_term.mean(dim=-2), dim=-1) # taking mean over nodes
+                    graph_term = torch.sigmoid(graph_term.mean(dim=-2)) # taking mean over nodes
                     graph_term = torch.unsqueeze(graph_term, 1)
                     current_batch_edge_logits = graph_term * new_p_logits + (1 - graph_term) * current_batch_edge_logits
                 ###########################

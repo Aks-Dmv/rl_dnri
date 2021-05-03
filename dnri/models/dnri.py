@@ -394,7 +394,7 @@ class DNRI(nn.Module):
         if self.normalize_nll_per_var:
             return neg_log_p.sum() / (target.size(0) * target.size(2))
         elif self.normalize_nll:
-            return (neg_log_p.sum(-1) + const)#.view(preds.size(0), -1).mean(dim=1)
+            return (neg_log_p.sum(-1))# + const).view(preds.size(0), -1).mean(dim=1)
         else:
             return neg_log_p.view(target.size(0), -1).sum() / (target.size(1))
 
@@ -752,7 +752,7 @@ class DNRI_Decoder(nn.Module):
 
         mu = self.mu_layer(pred)
         log_std = self.log_std_layer(pred)
-        log_std = torch.clamp(4*log_std, -3, -1)
+        log_std = torch.clamp(2*(log_std-2.), -5, -3)
         std = torch.exp(log_std)
 
         pi_distribution = Normal(mu, std)
@@ -859,7 +859,7 @@ class DNRI_MLP_Decoder(nn.Module):
 
         mu = self.mu_layer(pred)
         log_std = self.log_std_layer(pred)
-        log_std = torch.clamp(4*log_std, -3, -1)
+        log_std = torch.clamp(2*(log_std-2.), -5, -3)
         std = torch.exp(log_std)
 
         pi_distribution = Normal(mu, std)

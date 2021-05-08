@@ -126,7 +126,7 @@ if __name__ == '__main__':
     parser.add_argument('--same_data_norm', action='store_true')
     parser.add_argument('--no_data_norm', action='store_true')
     parser.add_argument('--error_out_name', default='prediction_errors_%dstep.npy')
-    parser.add_argument('--prior_variance', type=float, default=5e-5)
+    parser.add_argument('--prior_variance', type=float, default=4e-3)
     parser.add_argument('--test_burn_in_steps', type=int, default=10)
     parser.add_argument('--error_suffix')
     parser.add_argument('--subject_ind', type=int, default=-1)

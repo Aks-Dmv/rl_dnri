@@ -189,7 +189,7 @@ class DNRI(nn.Module):
         rewards_to_go[:, -1] = -1.*loss_nll[:, -1] # assuming finite-horizon MDP
         loss_critic = ((all_q1_c[:, :-1].mean(dim=-1) - rewards_to_go.detach())**2).mean() + ((all_q2_c[:, :-1].mean(dim=-1) - rewards_to_go.detach())**2).mean()
 
-        graph_rewards_to_go = -1.*loss_nll.mean(dim=-1) + gamma * (all_q_g_target[:, 1:].mean(dim=-1) + alpha * loss_kl[:, 1:])
+        graph_rewards_to_go = -1.*loss_nll.mean(dim=-1) + gamma * (all_q_g_target[:, 1:].mean(dim=-1) - alpha * loss_kl[:, 1:])
         graph_rewards_to_go[:, -1] = -1.*loss_nll[:, -1].mean(dim=-1) # assuming finite-horizon MDP
         loss_critic += ((all_q1_g[:, :-1].mean(dim=-1) - graph_rewards_to_go.detach())**2).mean() + ((all_q2_g[:, :-1].mean(dim=-1) - graph_rewards_to_go.detach())**2).mean()
 
@@ -247,6 +247,7 @@ class DNRI(nn.Module):
             # loss_kl = torch.unsqueeze(loss_kl, -1) # done to get the same shape for torch broadcasting
         
         loss_graph = alpha * loss_kl - all_q_g.mean(dim=-1)
+        print(all_q_pi.mean(),all_q_g.mean(),"q pi/q g")
 
         loss = loss_policy.mean() + loss_graph.mean()
 
@@ -279,6 +280,7 @@ class DNRI(nn.Module):
                 all_predictions.append(predictions)
         predictions = inputs[:, burn_in_timesteps-1]
         for step in range(prediction_steps):
+            predictions = predictions + torch.normal(0., 0.05, size=(predictions.shape[0],predictions.shape[1], predictions.shape[2])).cuda()
             new_p_logits, prior_hidden, graph_term = self.encoder.single_step_forward(predictions, prior_hidden)
             graph_term = torch.sigmoid(graph_term.mean(dim=-2)) # taking mean over nodes
             graph_term = torch.unsqueeze(graph_term, 1)

@@ -89,10 +89,12 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
                 p.requires_grad = True
             q_opt.zero_grad()
             opt.zero_grad()
-            for _ in range(5):
+            for _ in range(1):
                 loss_critic, loss_nll = model.calculate_loss_q(inputs, is_train=True, return_logits=True)
                 loss_critic.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+                print(loss_critic,"crit","0.9",epoch)
+                print(loss_nll,"nll")
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 q_opt.step()
                 q_opt.zero_grad()
                 opt.zero_grad()
@@ -104,7 +106,7 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
             # Finally, update Q_target networks by polyak averaging.
             # We only do it for the q_net, as we don't use the target policy
             with torch.no_grad():
-                polyak=0.995
+                polyak=0.9
                 for p, p_targ in zip(model.decoder.q_net.parameters(), model.decoder_targ.q_net.parameters()):
                     # NB: We use an in-place operations "mul_", "add_" to update target
                     # params, as opposed to "mul" and "add", which would make new tensors.
@@ -123,7 +125,8 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
             for _ in range(2):
                 loss, loss_policy, loss_kl, logits, _ = model.calculate_loss_pi(inputs, is_train=True, return_logits=True)
                 loss.backward() 
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)      
+                print(loss, "pol")
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)      
                 opt.step()
                 opt.zero_grad()
                 q_opt.zero_grad()

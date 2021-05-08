@@ -31,7 +31,7 @@ if __name__ == '__main__':
     else:
         params['input_time_steps'] = 50
     params['nll_loss_type'] = 'gaussian'
-    params['prior_variance'] = 4e-2
+    params['prior_variance'] = 4e-3
     name = 'cmu'
     train_data = CmuMotionData(name, args.data_path, 'train', params)
     val_data = CmuMotionData(name, args.data_path, 'valid', params)

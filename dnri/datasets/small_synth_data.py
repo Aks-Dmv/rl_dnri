@@ -76,31 +76,56 @@ if __name__ == '__main__':
     num_sims = args.num_train + args.num_val + args.num_test
     flip_count = 0
     total_steps = 0
+    radii_vals = np.array([1., 1.5, 2.])
+    ang_vel = 0.01*2*np.pi
     for sim in range(num_sims):
-        p1_loc = np.random.uniform(-2, -1, size=(2))
-        p1_vel = np.random.uniform(0.05, 0.1, size=(2))
-        p2_loc = np.random.uniform(1, 2, size=(2))
-        p2_vel = np.random.uniform(-0.05, -0.1, size=(2))
-        p3_loc = np.random.uniform(-1, 1, size=(2))
-        p3_vel = np.random.uniform(-0.05, 0.05, size=(2))
+        theta_vals = np.random.uniform(0, np.pi/2, size=(3))
+        p1_loc = radii_vals[0]*np.array([np.cos(theta_vals[0]), np.sin(theta_vals[0])])
+        p1_vel = np.zeros(2)
+        p2_loc = radii_vals[1]*np.array([np.cos(theta_vals[1]), np.sin(theta_vals[1])])
+        p2_vel = np.zeros(2)
+        p3_loc = radii_vals[2]*np.array([np.cos(theta_vals[2]), np.sin(theta_vals[2])])
+        p3_vel = np.zeros(2)
 
         current_feats = []
         current_edges = []
         for time_step in range(args.num_time_steps):
             current_edge = np.array([0,0,0,0,0,0])
             current_edges.append(current_edge)
-            if np.linalg.norm(p3_loc - p1_loc) < 1:
-                norm = np.linalg.norm(p3_loc - p1_loc)
-                coef = 1 - norm
-                dir_1 = (p3_loc - p1_loc)/norm
-                p3_vel += args.push_factor*coef*dir_1
-                current_edge[1] = 1
-            if np.linalg.norm(p3_loc - p2_loc) < 1:
-                norm = np.linalg.norm(p3_loc - p2_loc)
-                coef = 1 - norm
-                dir_2 = (p3_loc - p2_loc)/norm
-                p3_vel += args.push_factor*coef*dir_2
-                current_edge[3] = 1
+            theta_vals += ang_vel
+            n_thetas = theta_vals.shape[0]
+            """
+            edge to node convertion (i.e. 0th row means 
+                                    edge sends 0th node data to 1st node)
+                                    3rd row means 
+                                    edge sends 1st node data to 2nd node)
+            [0, 1, 0],
+            [0, 0, 1],
+            [1, 0, 0],
+            [0, 0, 1],
+            [1, 0, 0],
+            [0, 1, 0]
+
+            """
+            for i in range(n_thetas):
+                if theta_vals[i] > theta_vals[(i+1)%n_thetas]:
+                    theta_vals[i] += ang_vel*0.6
+                else:
+                    # go to either its future position, or move with ang vel
+                    theta_vals[i] += min(ang_vel, (ang_vel*0.6 + theta_vals[(i+1)%n_thetas]) - theta_vals[i])
+                    
+                    edge_arg = 2*i + (i+1)%n_thetas
+                    if (i+1)%n_thetas < i:
+                        edge_arg = 2*i + (i+1)%n_thetas
+                    else:
+                        edge_arg = 2*i + (i+1)%n_thetas - 1
+                    current_edge[edge_arg] = 1
+            p1_loc1 = radii_vals[0]*np.array([np.cos(theta_vals[0]), np.sin(theta_vals[0])])
+            p2_loc1 = radii_vals[1]*np.array([np.cos(theta_vals[1]), np.sin(theta_vals[1])])
+            p3_loc1 = radii_vals[2]*np.array([np.cos(theta_vals[2]), np.sin(theta_vals[2])])
+            p1_vel = p1_loc1 - p1_loc #0.2 * np.flip(p1_loc, 0) * [-1,1]
+            p2_vel = p2_loc1 - p2_loc #0.2 * np.flip(p2_loc, 0) * [-1,1]
+            p3_vel = p3_loc1 - p3_loc #0.2 * np.flip(p3_loc, 0) * [-1,1]
 
             p1_loc += p1_vel
             p2_loc += p2_vel
